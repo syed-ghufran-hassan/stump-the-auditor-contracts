@@ -67,6 +67,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public totalManagedWad;
     mapping(address => WithdrawRequest) public pendingWithdraw;
     mapping(address => uint256) public reservedForWithdraw;
+    mapping(address => uint256) public historicalFeeRecipientShares;
 
     uint256 public performanceFeeBps;
     uint256 public managementFeeBps;
@@ -185,7 +186,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         if (shares > availableShares) revert InsufficientShares(shares, availableShares);
 
         uint256 wadOwed = _computeAssets(shares, totalShares, _activeManagedWad());
-        uint256 reservedAmount = _fromWad(wadOwed, config.decimals);
+        uint256 reservedAmount = _fromWad(wadOwed, config.decimals, Math.Rounding.Ceil);
         if (wadOwed != 0 && reservedAmount == 0) revert ZeroAmount();
         uint256 effectiveWadOwed = _toWad(reservedAmount, config.decimals);
         uint256 availableLiquidity = _syncTrackedHoldings(asset, config);
@@ -426,6 +427,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     function setFeeRecipient(address recipient) external onlyOwner {
         _accrueFees(address(0));
 
+        historicalFeeRecipientShares[feeRecipient] += _unboundFeeShares[feeRecipient];
         if (recipient == address(0)) revert ZeroAddress();
         feeRecipient = recipient;
 
@@ -483,33 +485,32 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     ///      cancellations, and claim finalization preserve PPS up to round-down dust instead of appearing as new profit.
     ///      Pending withdrawals are fixed claims, leaving this path to price only active managed assets.
     function _accrueFees(address) internal {
-        uint256 currentTime = block.timestamp;
-        if (totalShares == 0) {
-            lastFeeAccrual = currentTime;
-            if (totalPendingWithdrawWad == 0 && totalManagedWad == 0) {
-                highWaterMarkPPS = 0;
-            }
-            return;
-        }
-
-        (,, uint256 mgmtFeeShares, uint256 perfFeeShares, uint256 newHighWaterMarkPPS) = _pendingFees();
-        uint256 feeShares = mgmtFeeShares + perfFeeShares;
-
-        if (feeShares != 0) {
-            // Fee shares are asset-agnostic until the recipient chooses a settlement asset on requestWithdraw().
-            _unboundFeeShares[feeRecipient] += feeShares;
-            totalShares += feeShares;
-        }
-        if (newHighWaterMarkPPS > highWaterMarkPPS) {
-            highWaterMarkPPS = newHighWaterMarkPPS;
-        }
-
+    uint256 currentTime = block.timestamp;
+    if (totalShares == 0) {
         lastFeeAccrual = currentTime;
-
-        if (mgmtFeeShares != 0 || perfFeeShares != 0) {
-            emit FeesAccrued(mgmtFeeShares, perfFeeShares, highWaterMarkPPS);
+        if (totalPendingWithdrawWad == 0 && totalManagedWad == 0) {
+            highWaterMarkPPS = 0;
         }
+        return;
     }
+
+    (,, uint256 mgmtFeeShares, uint256 perfFeeShares, uint256 newHighWaterMarkPPS) = _pendingFees();
+    uint256 feeShares = mgmtFeeShares + perfFeeShares;
+
+    if (feeShares != 0) {
+        _unboundFeeShares[feeRecipient] += feeShares;
+        totalShares += feeShares;
+    }
+    if (newHighWaterMarkPPS > highWaterMarkPPS) {
+        highWaterMarkPPS = newHighWaterMarkPPS;
+    }
+
+    lastFeeAccrual = currentTime;
+
+    if (mgmtFeeShares != 0 || perfFeeShares != 0) {
+        emit FeesAccrued(mgmtFeeShares, perfFeeShares, highWaterMarkPPS);
+    }
+}
 
     /// @notice Computes the fees that would accrue if `_accrueFees()` ran at the current timestamp.
     /// @return activeManagedWad The managed assets that still back active shares.
@@ -517,39 +518,43 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @return mgmtFeeShares The management fee shares that would mint.
     /// @return perfFeeShares The performance fee shares that would mint.
     /// @return newHighWaterMarkPPS The high water mark that would be stored.
-    function _pendingFees()
-        internal
-        view
-        returns (
-            uint256 activeManagedWad,
-            uint256 effectiveTotalShares,
-            uint256 mgmtFeeShares,
-            uint256 perfFeeShares,
-            uint256 newHighWaterMarkPPS
-        )
-    {
-        activeManagedWad = _activeManagedWad();
-        effectiveTotalShares = totalShares;
-        newHighWaterMarkPPS = highWaterMarkPPS;
+  function _pendingFees()
+    internal
+    view
+    returns (
+        uint256 activeManagedWad,
+        uint256 effectiveTotalShares,
+        uint256 mgmtFeeShares,
+        uint256 perfFeeShares,
+        uint256 newHighWaterMarkPPS
+    )
+{
+    activeManagedWad = _activeManagedWad();
+    effectiveTotalShares = totalShares;
+    newHighWaterMarkPPS = highWaterMarkPPS;
 
-        if (effectiveTotalShares == 0) return (activeManagedWad, effectiveTotalShares, 0, 0, newHighWaterMarkPPS);
-
-        uint256 dt = block.timestamp - lastFeeAccrual;
-        uint256 profitShareSupply = effectiveTotalShares;
-        if (dt != 0 && managementFeeBps != 0) {
-            mgmtFeeShares =
-                Math.mulDiv(effectiveTotalShares, managementFeeBps * dt, BPS * SECONDS_PER_YEAR, Math.Rounding.Floor);
-            effectiveTotalShares += mgmtFeeShares;
-        }
-
-        (, uint256 profitWad) = _profitAboveHighWaterMarkWad(activeManagedWad, profitShareSupply, newHighWaterMarkPPS);
-        if (profitWad != 0) {
-            uint256 perfFeeWad = Math.mulDiv(profitWad, performanceFeeBps, BPS, Math.Rounding.Floor);
-            perfFeeShares = _computeFeeShares(perfFeeWad, effectiveTotalShares, activeManagedWad);
-            effectiveTotalShares += perfFeeShares;
-            newHighWaterMarkPPS = _currentPPS(activeManagedWad, effectiveTotalShares);
-        }
+    if (effectiveTotalShares == 0) return (activeManagedWad, effectiveTotalShares, 0, 0, newHighWaterMarkPPS);
+    
+     
+   
+     uint256 dt = block.timestamp - lastFeeAccrual; 
+  
+    
+    uint256 profitShareSupply = effectiveTotalShares;
+    if (dt != 0 && managementFeeBps != 0) {
+        mgmtFeeShares =
+            Math.mulDiv(effectiveTotalShares, managementFeeBps * dt, BPS * SECONDS_PER_YEAR, Math.Rounding.Floor);
+        effectiveTotalShares += mgmtFeeShares;
     }
+
+    (, uint256 profitWad) = _profitAboveHighWaterMarkWad(activeManagedWad, profitShareSupply, newHighWaterMarkPPS);
+    if (profitWad != 0) {
+        uint256 perfFeeWad = Math.mulDiv(profitWad, performanceFeeBps, BPS, Math.Rounding.Floor);
+        perfFeeShares = _computeFeeShares(perfFeeWad, effectiveTotalShares, activeManagedWad);
+        effectiveTotalShares += perfFeeShares;
+        newHighWaterMarkPPS = _currentPPS(activeManagedWad, effectiveTotalShares);
+    }
+}
 
     /// @notice Returns the gross WAD profit above a reference high-water-mark PPS.
     /// @param managedWad The managed assets backing the active pool.
@@ -734,4 +739,5 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         _pendingUsers.pop();
         delete _pendingUserIndexPlusOne[user];
     }
+  
 }
